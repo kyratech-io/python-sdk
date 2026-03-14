@@ -11,7 +11,6 @@ class GovernanceContextDto:
     chain_depth: int = 0
     aggregate_rows_affected: int = 0
     aggregate_action_count: int = 0
-    highest_tier_in_chain: str = ""
     session_id: str = ""
     parent_trace_id: Optional[str] = None
     parent_agent_id: Optional[str] = None
@@ -27,14 +26,32 @@ class GovernanceContextDto:
         }
         if self.aggregate_action_count != 0:
             d["aggregateActionCount"] = self.aggregate_action_count
-        if self.highest_tier_in_chain:
-            d["highestTierInChain"] = self.highest_tier_in_chain
         if self.session_id:
             d["sessionId"] = self.session_id
         if self.parent_trace_id:
             d["parentTraceId"] = self.parent_trace_id
         if self.parent_agent_id:
             d["parentAgentId"] = self.parent_agent_id
+        return d
+
+
+@dataclass
+class AgentContext:
+    reasoning: Optional[str] = None
+    chosen_action: Optional[str] = None
+    confidence: Optional[float] = None
+    memory_ids_used: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        d: Dict[str, Any] = {}
+        if self.reasoning is not None:
+            d["reasoning"] = self.reasoning
+        if self.chosen_action is not None:
+            d["chosenAction"] = self.chosen_action
+        if self.confidence is not None:
+            d["confidence"] = self.confidence
+        if self.memory_ids_used:
+            d["memoryIdsUsed"] = list(self.memory_ids_used)
         return d
 
 
@@ -51,8 +68,13 @@ class ActionRequest:
     sdk_version: str = "1.0.0"
     prompt_hash: Optional[str] = None
     agent_trace: Optional[dict] = None
-    requested_tier: Optional[str] = None  # floor hint; server uses max(llmClassified, requested)
     mode: Optional[str] = None  # ENFORCE | SHADOW — request server to use this mode
+    # Top-level sessionId for easier indexing on the server; duplicated
+    # from GovernanceContextDto.session_id when present.
+    session_id: Optional[str] = None
+    # Top-level traceId: user-provided or from context; None = server generates.
+    trace_id: Optional[str] = None
+    agent_context: Optional[AgentContext] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -69,10 +91,14 @@ class ActionRequest:
             d["promptHash"] = self.prompt_hash
         if self.agent_trace:
             d["agentTrace"] = self.agent_trace
-        if self.requested_tier:
-            d["requestedTier"] = self.requested_tier
         if self.mode:
             d["mode"] = self.mode
+        if self.session_id:
+            d["sessionId"] = self.session_id
+        if self.trace_id is not None:
+            d["traceId"] = self.trace_id
+        if self.agent_context:
+            d["agentContext"] = self.agent_context.to_dict()
         return d
 
 @dataclass
@@ -116,6 +142,7 @@ class EvaluationDecision:
     escalation_id: Optional[str] = None
     evaluation_ms: int = 0
     gate_results: List[GateResultDto] = field(default_factory=list)
+    kyra_event_id: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "EvaluationDecision":
@@ -141,6 +168,7 @@ class EvaluationDecision:
             escalation_id=d.get("escalationId"),
             evaluation_ms=d.get("evaluationMs", 0),
             gate_results=gate_results,
+            kyra_event_id=d.get("kyraEventId"),
         )
 
 

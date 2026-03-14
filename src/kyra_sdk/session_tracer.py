@@ -133,6 +133,8 @@ class SessionTracer:
         execution_time_ms: int = 0,
         success: bool = True,
         sequence_number: Optional[int] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        timestamp_epoch_ms: Optional[int] = None,
     ) -> None:
         try:
             with self._lock:
@@ -146,6 +148,10 @@ class SessionTracer:
                     "success": success,
                     "sequenceNumber": sequence_number or self._next_seq(),
                 }
+                if parameters is not None:
+                    result["parameters"] = parameters
+                if timestamp_epoch_ms is not None:
+                    result["timestampEpochMs"] = timestamp_epoch_ms
                 self._tool_results.append(result)
                 if len(self._tool_results) > MAX_PRIOR_TOOL_RESULTS:
                     self._tool_results = self._tool_results[-MAX_PRIOR_TOOL_RESULTS:]

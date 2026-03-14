@@ -1,333 +1,238 @@
-## Kyra Python SDK Integration – Function-by-function Guide (`langchain-kyra`)
+# Kyra Python SDK
 
-This guide explains the Kyra governance SDK for Python in terms of the **functions and classes you call from your agent**, using a consistent structure:
-
-- **Function name**
-- **How and where to use**
-- **Code snippet / example**
-- **Other relevant information**
-
-It targets LangChain, CrewAI, and LangGraph agents built in Python.
+Runtime governance for AI agent actions in Python (LangChain, CrewAI, LangGraph). Every tool call is evaluated by Kyra before execution; blocked actions raise `ErrGovernanceBlock` so your agent can respond safely.
 
 ---
 
-## High-level flow (what you do per agent)
+## Install
 
-For a typical Python agent using Kyra:
-
-1. Create a `KyraGovernor` with your API key and configuration.
-2. Wrap your tools with `governor.wrap(tools, framework=...)`.
-3. (Optional but recommended) Use `GovernanceContext` and `set_context` to propagate governance metadata across your run.
-4. Catch `ErrGovernanceBlock` (or Kyra-specific exceptions) when actions are blocked, escalated, or missing parameters.
-
-The sections below walk the main APIs in that structure.
-
----
-
-## Core configuration and setup
-
-### `KyraGovernor`
-
-- **Function name**: `KyraGovernor(api_key: str, **config)`
-- **How and where to use**:
-  - Instantiate once when your application or agent process starts.
-  - Reuse the same governor object across runs of the same logical agent.
-- **Code snippet / example**:
-
-```python
-from langchain_kyra import KyraGovernor
-
-governor = KyraGovernor(
-    api_key="kyra_sk_...",        # required
-    server_url="https://api.kyratech.io",  # optional, default may be set in the SDK
-    fail_open=True,               # allow when Kyra is unreachable; set False to fail closed
-    mode="enforce",               # "enforce" | "shadow"
-    agent_id="my-agent-v1",       # optional but recommended
-)
+```bash
+pip install kyra-sdk
 ```
 
-- **Other relevant information**:
-  - `mode="enforce"` means tool calls are blocked on policy violation.
-  - `mode="shadow"` means Kyra evaluates but does not block (violations are logged only).
-  - `fail_open=True` allows the action if the Kyra server is unreachable; `False` raises a server-unavailable-style error instead.
+The base package works with any tool (generic). To use Kyra’s wrappers for a specific framework, install the matching extra so those dependencies are available:
+
+| Extra | Adds | Use when |
+|-------|------|----------|
+| `[langchain]` | langchain-core | Wrapping LangChain tools / AgentExecutor |
+| `[langgraph]` | langgraph | Wrapping a LangGraph tool node |
+| `[crewai]` | crewai | Wrapping CrewAI tools |
+| `[all]` | all of the above | Supporting multiple frameworks |
+
+```bash
+pip install kyra-sdk[langchain]
+pip install kyra-sdk[langgraph]
+pip install kyra-sdk[crewai]
+pip install kyra-sdk[all]
+```
+
+---
+
+## Quick start
+
+```python
+from kyra_sdk import KyraGovernor, GovernanceContext, set_context, ErrGovernanceBlock
+
+# 1. Create governor (once per process or per agent)
+governor = KyraGovernor(
+    api_key="kyra_sk_...",
+    agent_id="my-agent-v1",
+    fail_open=False,
+)
+
+# 2. Build your tools (LangChain, CrewAI, or generic) and wrap them
+tools = [search_tool, refund_tool]
+governed_tools = governor.wrap(tools)
+
+# 3. For each run: create governance context from the user message and set it
+ctx = GovernanceContext.from_human_message(
+    "Refund order 123 if policy allows",
+    root_agent_id="my-agent-v1",
+)
+set_context(ctx)
+
+# 4. Run your agent with governed_tools; tool invocations are evaluated by Kyra
+try:
+    result = await agent.ainvoke({"input": "Refund order 123"})
+except ErrGovernanceBlock as e:
+    print("Blocked by policy:", e.msg)
+```
+
+---
+
+## Configuration
+
+Create the governor with your API key and optional settings:
+
+| Argument | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `api_key` | Yes | — | Your Kyra API key (`kyra_sk_...`) |
+| `timeout_ms` | No | 5000 | Request timeout in milliseconds |
+| `fail_open` | No | `True` | If True, allow tool execution when Kyra is unreachable |
+| `mode` | No | `None` | `"enforce"` or `"shadow"` — sent to server as ENFORCE / SHADOW |
+| `agent_id` | No | `None` | Agent identifier for evaluate requests; recommended for multi-agent |
+| `session_intent` | No | `None` | Optional session-level intent hint |
+| `framework` | No | `"LANGCHAIN"` | Reported in wire format |
+
+**Example (fail-closed, enforce mode):**
+
+```python
+governor = KyraGovernor(
+    api_key=os.environ["KYRA_API_KEY"],
+    agent_id="refund-agent-v1",
+    fail_open=False,
+    mode="enforce",
+)
+```
 
 ---
 
 ## Wrapping tools
 
-### `governor.wrap(tools, framework=None)`
+Call `governor.wrap(tools)` after building your tool list. Use the **returned** tools in your agent so every invocation goes through Kyra first.
 
-- **Function name**: `governor.wrap(tools, framework: str | None = None)`
-- **How and where to use**:
-  - Call after you build your tools list (LangChain Tools, CrewAI tools, etc.).
-  - Use the **returned tools** instead of the raw ones in your agent.
-- **Code snippet / example (generic / minimal)**:
+### Generic / CrewAI / Alchemyst
 
 ```python
-from langchain_kyra import KyraGovernor
-
-governor = KyraGovernor(api_key="kyra_sk_...")
-governed_tools = governor.wrap(tools)  # returns a list — use directly as tools
+governed_tools = governor.wrap(tools)
+# Use governed_tools in your agent
 ```
 
-- **Code snippet / example (LangChain with telemetry)**:
+### LangChain (with telemetry callback)
+
+When using LangChain, pass `framework="langchain"` to get governed tools plus a callback that records LLM and tool activity (including agent trace with thinking when the model returns it) for Kyra:
 
 ```python
-from langchain_kyra import KyraGovernor
-from langchain.agents import create_react_agent
-
-governor = KyraGovernor(api_key="kyra_sk_...")
 governed_tools, callback = governor.wrap(tools, framework="langchain")
-
 agent = create_react_agent(llm=llm, tools=governed_tools, prompt=prompt)
-# When using AgentExecutor: AgentExecutor(..., callbacks=[callback])
+# When using AgentExecutor:
+executor = AgentExecutor(agent=agent, tools=governed_tools, callbacks=[callback])
 ```
 
-- **Other relevant information**:
-  - With `framework="langchain"`, `wrap` returns `(governed_tools, callback)`:
-    - `governed_tools`: tools that perform Kyra evaluation before execution.
-    - `callback`: a `KyraLangChainCallback` that records LLM inputs/outputs, tool choices, and results.
-  - For other frameworks (CrewAI, LangGraph) you pass `framework="crewai"` or `framework="langgraph"`; the function still returns governed tools compatible with those frameworks.
+### LangGraph
+
+```python
+# Wrap the tool node so all tool calls are governed
+governed_tool_node = governor.wrap(tool_node, framework="langgraph")
+# Use governed_tool_node in your graph
+```
 
 ---
 
 ## Governance context (per run)
 
-### `GovernanceContext.from_human_message`
+Set a governance context at the start of each run so all Kyra evaluations in that run share the same trace, session, and intent. **Trace ID** can be user-provided (e.g. from your context) or omitted so Kyra auto-generates it; the decision returned from each evaluate always includes the trace ID used.
 
-- **Function name**: `GovernanceContext.from_human_message(intent: str, root_agent_id: str)`
-- **How and where to use**:
-  - Call at the start of a run, using the **first user message** and the root agent ID.
-  - Then attach it via `set_context` so all Kyra evaluations in this run share the same governance metadata.
-- **Code snippet / example**:
+### From user message
 
 ```python
-from langchain_kyra import GovernanceContext, set_context
+from kyra_sdk import GovernanceContext, set_context, get_context
 
 ctx = GovernanceContext.from_human_message(
     "Refund order 123 if policy allows",
     root_agent_id="refund-agent-v1",
 )
-
 set_context(ctx)
-# Run your agent here; Kyra will see governanceContext (traceId, intent, etc.)
+
+# Run your agent; Kyra will use this context for every tool evaluate
+result = await agent.ainvoke({"input": "..."})
+
+# Optional: read current context
+current = get_context()
+if current:
+    print("Trace ID:", current.trace_id, "Session ID:", current.session_id)
 ```
 
-- **Other relevant information**:
-  - `GovernanceContext` tracks:
-    - `trace_id`, `session_id`
-    - `root_agent_id`
-    - `original_intent_verbatim` (first user message)
-    - `aggregate_action_count`, `aggregate_rows_affected`
-    - `highest_tier_in_chain` (T0–T4)
+### From agent spawn (multi-agent)
 
----
-
-### `GovernanceContext.from_agent_spawn`
-
-- **Function name**: `GovernanceContext.from_agent_spawn(parent: GovernanceContext, child_agent_id: str)`
-- **How and where to use**:
-  - Use when a top-level/orchestrator agent spawns a child agent and you want Kyra to track the parent/child relationship.
-- **Code snippet / example**:
+When an orchestrator delegates to a sub-agent, create a child context so Kyra can link the sub-agent’s trace to the parent:
 
 ```python
-from langchain_kyra import GovernanceContext, set_context
-
 parent = GovernanceContext.from_human_message(
     "Refund order 123",
     root_agent_id="orchestrator-agent",
 )
-
-child = GovernanceContext.from_agent_spawn(
-    parent,
-    child_agent_id="refund-agent-v1",
-)
-
+child = GovernanceContext.from_agent_spawn(parent, child_agent_id="refund-agent-v1")
 set_context(child)
-# Run the child agent here; Kyra will send parentTraceId/parentAgentId
-```
 
-- **Other relevant information**:
-  - This allows Kyra to reason over full chains of agents when applying policies or analysis.
+# Run the sub-agent; Kyra will receive parentTraceId / parentAgentId
+result = await refund_agent.ainvoke(...)
+```
 
 ---
 
-### `set_context` / `get_context`
+## Agent registration (optional)
 
-- **Function names**:
-  - `set_context(ctx: GovernanceContext) -> None`
-  - `get_context() -> GovernanceContext | None`
-- **How and where to use**:
-  - `set_context` is called once per run (after creating the appropriate context).
-  - `get_context` is generally only needed in advanced scenarios; most users rely on the SDK attaching context automatically for evaluations.
-- **Code snippet / example**:
+You can register your agent with Kyra so the server associates evaluate requests with a known agent (and optional policies):
 
 ```python
-from langchain_kyra import GovernanceContext, set_context, get_context
-
-ctx = GovernanceContext.from_human_message("...", root_agent_id="my-agent-v1")
-set_context(ctx)
-
-# Later, inside your code:
-current_ctx = get_context()
+agent_id = governor.register_agent(
+    agent_name="Refund Agent",
+    system_prompt=system_prompt,
+    tools=tools,
+)
+# agent_id is stored on the governor and used for subsequent evaluate calls
 ```
 
-- **Other relevant information**:
-  - Under the hood, the SDK uses this context when building the `ActionRequest` sent to Kyra.
+Optional: pass a list of `PolicyDocument` for server-side policies (see Policies section below).
 
 ---
 
-## Error handling and outcomes
+## Error handling
 
-### `ErrGovernanceBlock`
-
-- **Function name**: `class ErrGovernanceBlock(Exception)`
-- **How and where to use**:
-  - Raised by **wrapped tools** when Kyra decides the action must not proceed (BLOCK, ESCALATE, or fail-closed server errors).
-  - Catch it around your tool invocations or inside your agent’s error handling layer.
-- **Code snippet / example**:
+When Kyra blocks an action (BLOCK, ESCALATE, or server unreachable with `fail_open=False`), wrapped tools raise **`ErrGovernanceBlock`**. Catch it to inform the user or trigger escalation:
 
 ```python
-from langchain_kyra import ErrGovernanceBlock
+from kyra_sdk import ErrGovernanceBlock
 
 try:
-    result = await some_governed_tool.ainvoke({"param": "value"})
+    result = await governed_tool.ainvoke({"order_id": "123", "amount": 50.0})
 except ErrGovernanceBlock as e:
     print("Governance block:", e.msg)
-    # Decide whether to ask the user for more details, surface an escalation message,
-    # or stop the run.
+    # e.msg is safe to log or show to users
 ```
 
-- **Other relevant information**:
-  - The single exported error type for “this call should not proceed”.
-  - Its `msg` field is safe to log or present to users.
+### Exception hierarchy (optional)
 
----
-
-### Kyra exception hierarchy (optional advanced usage)
-
-- **Function / class names**:
-  - `KyraException`
-  - `KyraBlockedException`
-  - `KyraEscalationDeniedException`
-  - `KyraReturnToUserException`
-  - `KyraServerUnavailableException`
-- **How and where to use**:
-  - Useful if you work directly with `EvaluationDecision` or advanced flows where you differentiate between “blocked”, “escalation denied”, and “return to user”.
-- **Code snippet / example**:
+For finer handling you can catch Kyra-specific exceptions:
 
 ```python
-from langchain_kyra import KyraReturnToUserException
+from kyra_sdk import (
+    KyraBlockedException,
+    KyraEscalationDeniedException,
+    KyraReturnToUserException,
+    KyraServerUnavailableException,
+)
 
 try:
-    result = await some_governed_tool.ainvoke(params)
+    result = await governed_tool.ainvoke(params)
 except KyraReturnToUserException as e:
     print("Missing parameters:", e.missing_parameters)
     # Ask the user to supply the missing fields
-```
-
-- **Other relevant information**:
-  - All these classes carry an optional `EvaluationDecision` for more detailed inspection (gates, tier, outcome, etc.).
-
----
-
-## Policies, tiers, and evaluation model
-
-### `PolicyDocument` (wire model)
-
-- **Function name**: `class PolicyDocument(dataclass)`
-- **How and where to use**:
-  - Represents explicit policies the server enforces; typically used when you construct registration payloads or call lower-level APIs.
-- **Code snippet / example**:
-
-```python
-from langchain_kyra.models import PolicyDocument
-
-policies = [
-    PolicyDocument(
-        policy_id="refundco-cash-only-v1",
-        description="Refunds must be cash only",
-        applies_to_tools=["issue_refund", "issue_chargeback_response"],  # multiple tools example
-        condition="params.type != cash",
-        action="BLOCK",
-        tier="T2",
-    ),
-]
-```
-
-- **Other relevant information**:
-  - Field meanings:
-    - `policy_id`: unique ID for the policy.
-    - `description`: human-readable summary.
-    - `applies_to_tools`: one or more tool names this policy should apply to.
-    - `condition`: expression evaluated on the request (params, governance context, etc.).
-    - `action`: `"BLOCK"` or `"ESCALATE"`.
-    - `tier`: governance tier for this policy (`"T0"`–`"T4"`), see below.
-
----
-
-### Tiers (`requested_tier`, `tier`, and evaluation tier)
-
-- **Function / field names**:
-  - `requested_tier` on `ActionRequest`
-  - `tier` on `PolicyDocument`
-  - `tier` on `EvaluationDecision`
-- **How and where to use**:
-  - Use `requested_tier` to **floor** the risk level of a tool call (server uses `max(llmClassifiedTier, requested_tier)`).
-  - Use `tier` on `PolicyDocument` to describe how sensitive the policy is.
-- **Other relevant information**:
-  - Typical meanings:
-    - `T0`: read-only / informational actions (e.g. lookups).
-    - `T1`: low-risk writes (e.g. updating non-critical metadata).
-    - `T2`: medium-risk actions (e.g. reversible financial operations).
-    - `T3`: high-risk actions (e.g. irreversible payments, chargebacks).
-    - `T4`: very high-risk / critical controls (e.g. admin-only or production-wide changes).
-
----
-
-## Install, build, and publish (for context)
-
-These are not functions, but are useful when wiring the SDK into your environment.
-
-### Install
-
-- **How and where to use**:
-  - Install the Python SDK from PyPI.
-- **Code snippet / example**:
-
-```bash
-pip install langchain-kyra
-
-# With optional framework extras:
-pip install langchain-kyra[langchain]
-pip install langchain-kyra[crewai]
-pip install langchain-kyra[langgraph]
-pip install langchain-kyra[all]
+except KyraBlockedException:
+    print("Action blocked by policy")
+except KyraEscalationDeniedException:
+    print("Escalation was denied")
+except KyraServerUnavailableException:
+    print("Kyra server unreachable (and fail_open=False)")
 ```
 
 ---
 
-### Build (local)
+## Policies (reference)
 
-- **How and where to use**:
-  - Build the package locally when developing or testing changes to the SDK.
-- **Code snippet / example**:
-
-```bash
-pip install build
-python -m build
-pip install dist/langchain_kyra-1.0.0-py3-none-any.whl  # local test
-```
+**PolicyDocument** is used when registering agents or configuring server-side policies (policy_id, description, applies_to_tools, condition, action, and optional fields per server API). See the SDK source and Kyra server docs for full policy semantics.
 
 ---
 
-### Publish (to PyPI)
+## Summary
 
-- **How and where to use**:
-  - Upload built distributions to PyPI using `twine`.
-- **Code snippet / example**:
+| Step | What to do |
+|------|------------|
+| 1 | Create `KyraGovernor(api_key=..., agent_id=..., fail_open=...)` |
+| 2 | Wrap tools with `governor.wrap(tools)` or `governor.wrap(tools, framework="langchain")` |
+| 3 | For each run: `ctx = GovernanceContext.from_human_message(msg, root_agent_id)` and `set_context(ctx)` |
+| 4 | Run your agent with the governed tools |
+| 5 | Catch `ErrGovernanceBlock` when an action is blocked |
 
-```bash
-twine upload dist/*
-```
-
+Optional: call `register_agent()` at startup, and use `GovernanceContext.from_agent_spawn(parent, child_agent_id)` when delegating from an orchestrator to a sub-agent.

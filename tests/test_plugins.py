@@ -1,5 +1,5 @@
 import pytest
-from langchain_kyra import KyraGovernor
+from kyra_sdk import KyraGovernor
 
 
 def test_wrap_returns_same_count():

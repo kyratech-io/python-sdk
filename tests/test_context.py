@@ -1,5 +1,5 @@
 import pytest
-from langchain_kyra import GovernanceContext, get_context, set_context
+from kyra_sdk import GovernanceContext, get_context, set_context
 
 
 def test_from_human_message():

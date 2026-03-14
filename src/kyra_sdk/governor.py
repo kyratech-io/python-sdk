@@ -13,13 +13,8 @@ from .models import (
     PolicyDocument,
 )
 
-logger = logging.getLogger("langchain_kyra")
+logger = logging.getLogger("kyra_sdk")
 SDK_VERSION = "1.0.0"
-
-
-def _tier_order(tier: str) -> int:
-    """Return numeric order for tier comparison (T0 < T1 < T2 < T3 < T4)."""
-    return {"T0": 0, "T1": 1, "T2": 2, "T3": 3, "T4": 4}.get(tier, -1)
 
 
 def _normalize_mode(mode: Optional[str]) -> Optional[str]:
@@ -66,13 +61,15 @@ class KyraGovernor:
     def __init__(
         self,
         api_key: str,
-        server_url: str = "https://api.kyra.dev",
+        server_url: str = "https://api.kyratech.io",
         timeout_ms: int = 5000,
         fail_open: bool = True,
         mode: Optional[str] = None,  # "enforce" | "shadow" — sent as ENFORCE | SHADOW
         agent_id: Optional[str] = None,
         session_intent: Optional[str] = None,
         framework: str = "LANGCHAIN",
+        additional_llm_endpoints: Optional[List[str]] = None,
+        memory_endpoints: Optional[List[str]] = None,
     ):
         self.api_key = api_key
         self.server_url = server_url.rstrip("/")
@@ -82,9 +79,13 @@ class KyraGovernor:
         self.agent_id = agent_id
         self.session_intent = session_intent
         self.framework = framework
+        self._llm_endpoints: List[str] = additional_llm_endpoints or []
+        self._memory_endpoints: List[str] = memory_endpoints or []
         self._registered_agent_id: Optional[str] = None
         self._prompt_hash: Optional[str] = None
         self._tracer = SessionTracer()
+        # Track sessions we've already emitted SESSION_STARTED for (avoid duplicates).
+        self._started_sessions: set[str] = set()
 
         self._client = httpx.Client(
             headers={"X-Kyra-Key": api_key, "Content-Type": "application/json"},
@@ -96,6 +97,22 @@ class KyraGovernor:
         )
         self._poller_stop = threading.Event()
         self._start_escalation_poller()
+
+        # Configure audit queue and HTTP interceptor defaults so that
+        # HTTP calls made within this process can emit audit telemetry
+        # without impacting the main evaluation path.
+        try:
+            from .audit import audit_queue  # type: ignore
+            from .core import http_interceptor  # type: ignore
+
+            audit_queue.configure(self.server_url)
+            http_interceptor.configure_endpoints(
+                llm_endpoints=self._llm_endpoints,
+                memory_endpoints=self._memory_endpoints,
+            )
+        except Exception:
+            # Never fail governor construction due to optional audit wiring.
+            pass
 
     def wrap(
         self,
@@ -142,12 +159,31 @@ class KyraGovernor:
         tool_name: str,
         tool_description: str,
         parameters: dict,
-        requested_tier: Optional[str] = None,
         framework_override: Optional[str] = None,
+        agent_context: Optional[Any] = None,
+        trace_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Single internal evaluation path — all adapters use this."""
+        """Single internal evaluation path — all adapters use this.
+        agent_context: optional override; when None, uses get_agent_context() (thread-local).
+        """
         ctx = get_context()
+        # Lazy SESSION_STARTED: emit once per session before first evaluate in that session.
+        try:
+            sid = ctx.session_id if ctx else None
+            if sid and sid not in self._started_sessions:
+                self._started_sessions.add(sid)
+                self._emit_session_event("SESSION_STARTED", sid)
+        except Exception:
+            pass
         framework = normalize_framework(framework_override) if framework_override else self.framework
+        if agent_context is None:
+            try:
+                from .agent_context import get_agent_context  # type: ignore
+                agent_ctx = get_agent_context()
+            except Exception:
+                agent_ctx = None
+        else:
+            agent_ctx = agent_context
         req = ActionRequest(
             tool_name=tool_name,
             tool_description=tool_description,
@@ -159,8 +195,10 @@ class KyraGovernor:
             sdk_version=SDK_VERSION,
             prompt_hash=self._prompt_hash,
             agent_trace=self._tracer.build_agent_trace(),
-            requested_tier=requested_tier,
             mode=self._normalize_mode(self.mode),
+            session_id=ctx.session_id if ctx else None,
+            trace_id=trace_id or (ctx.trace_id if ctx else None),
+            agent_context=agent_ctx,
         )
         try:
             resp = self._client.post(
@@ -174,17 +212,18 @@ class KyraGovernor:
             if self.fail_open:
                 return (True, "")
             raise KyraServerUnavailableException(str(e))
+        # Persist kyraEventId on the governance context for tool-result audit.
+        if ctx is not None:
+            ctx.last_kyra_event_id = decision.kyra_event_id
         ok, block_reason = self._handle_decision(decision)
         if not ok and decision.outcome == "ESCALATE" and decision.escalation_id:
             threading.Thread(
                 target=self._post_escalation_async,
-                args=(tool_name, tool_description, parameters, requested_tier or "", decision),
+                args=(tool_name, tool_description, parameters, "", decision),
                 daemon=True,
             ).start()
         if ok and ctx is not None:
             ctx.aggregate_action_count += 1
-            if decision.tier and _tier_order(decision.tier) > _tier_order(ctx.highest_tier_in_chain):
-                ctx.highest_tier_in_chain = decision.tier
         return (ok, block_reason)
 
     def evaluate(
@@ -192,15 +231,18 @@ class KyraGovernor:
         tool_name: str,
         tool_description: str,
         parameters: dict,
-        requested_tier: Optional[str] = None,
         framework_override: Optional[str] = None,
+        agent_context: Optional[Any] = None,
+        trace_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Returns (ok, block_reason). ok=True for ALLOW, False for BLOCK/ESCALATE/server error.
         On ESCALATE returns (False, reason) and fires async POST to /v1/escalations.
+        agent_context: optional; when provided, used for this call instead of get_agent_context().
+        trace_id: optional; user-provided or from context; if not set, server generates one.
         """
         return self._evaluate_before_call(
-            tool_name, tool_description, parameters, requested_tier, framework_override
+            tool_name, tool_description, parameters, framework_override, agent_context, trace_id
         )
 
     async def _evaluate_before_call_async(
@@ -208,12 +250,29 @@ class KyraGovernor:
         tool_name: str,
         tool_description: str,
         parameters: dict,
-        requested_tier: Optional[str] = None,
         framework_override: Optional[str] = None,
+        agent_context: Optional[Any] = None,
+        trace_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Async single internal evaluation path."""
+        """Async single internal evaluation path. agent_context: optional override; else get_agent_context(). trace_id: optional; if not set, server generates."""
         ctx = get_context()
+        # Lazy SESSION_STARTED: emit once per session before first evaluate in that session.
+        try:
+            sid = ctx.session_id if ctx else None
+            if sid and sid not in self._started_sessions:
+                self._started_sessions.add(sid)
+                self._emit_session_event("SESSION_STARTED", sid)
+        except Exception:
+            pass
         framework = normalize_framework(framework_override) if framework_override else self.framework
+        if agent_context is None:
+            try:
+                from .agent_context import get_agent_context  # type: ignore
+                agent_ctx = get_agent_context()
+            except Exception:
+                agent_ctx = None
+        else:
+            agent_ctx = agent_context
         req = ActionRequest(
             tool_name=tool_name,
             tool_description=tool_description,
@@ -225,8 +284,10 @@ class KyraGovernor:
             sdk_version=SDK_VERSION,
             prompt_hash=self._prompt_hash,
             agent_trace=self._tracer.build_agent_trace(),
-            requested_tier=requested_tier,
             mode=self._normalize_mode(self.mode),
+            session_id=ctx.session_id if ctx else None,
+            trace_id=trace_id or (ctx.trace_id if ctx else None),
+            agent_context=agent_ctx,
         )
         try:
             resp = await self._async_client.post(
@@ -240,17 +301,17 @@ class KyraGovernor:
             if self.fail_open:
                 return (True, "")
             raise KyraServerUnavailableException(str(e))
+        if ctx is not None:
+            ctx.last_kyra_event_id = decision.kyra_event_id
         ok, block_reason = self._handle_decision(decision)
         if not ok and decision.outcome == "ESCALATE" and decision.escalation_id:
             threading.Thread(
                 target=self._post_escalation_async,
-                args=(tool_name, tool_description, parameters, requested_tier or "", decision),
+                args=(tool_name, tool_description, parameters, "", decision),
                 daemon=True,
             ).start()
         if ok and ctx is not None:
             ctx.aggregate_action_count += 1
-            if decision.tier and _tier_order(decision.tier) > _tier_order(ctx.highest_tier_in_chain):
-                ctx.highest_tier_in_chain = decision.tier
         return (ok, block_reason)
 
     async def evaluate_async(
@@ -258,12 +319,13 @@ class KyraGovernor:
         tool_name: str,
         tool_description: str,
         parameters: dict,
-        requested_tier: Optional[str] = None,
         framework_override: Optional[str] = None,
+        agent_context: Optional[Any] = None,
+        trace_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Async version of evaluate(); returns (ok, block_reason)."""
         return await self._evaluate_before_call_async(
-            tool_name, tool_description, parameters, requested_tier, framework_override
+            tool_name, tool_description, parameters, framework_override, agent_context, trace_id
         )
 
     def _normalize_mode(self, mode: Optional[str]) -> Optional[str]:
@@ -334,9 +396,65 @@ class KyraGovernor:
         t = threading.Thread(target=poll, daemon=True)
         t.start()
 
+    def _emit_tool_result(
+        self,
+        tool_name: str,
+        execution_time_ms: int,
+        success: bool,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """
+        Emit a lightweight tool result audit event when kyraEventId is available.
+        """
+        try:
+            from .governance_context import get_context  # type: ignore
+            from .audit import get_audit_queue  # type: ignore
+        except Exception:
+            return
+        ctx = get_context()
+        if not ctx or not getattr(ctx, "last_kyra_event_id", None):
+            return
+        status = "SUCCESS" if success else "FAILURE"
+        payload = {
+            "agentId": ctx.root_agent_id,
+            "sessionId": ctx.session_id,
+            "kyraEventId": ctx.last_kyra_event_id,
+            "status": status,
+            "durationMs": execution_time_ms,
+        }
+        if not success and error_message:
+            payload["errorMessage"] = error_message
+        try:
+            queue = get_audit_queue()
+            queue.enqueue_tool_result(payload)
+        except Exception:
+            pass
+
     def _empty_ctx(self):
         from .models import GovernanceContextDto
         return GovernanceContextDto()
+
+    def _emit_session_event(self, event_type: str, session_id: str) -> None:
+        """
+        Emit a SESSION_STARTED or SESSION_COMPLETED audit event for the given session.
+        """
+        try:
+            from .audit import get_audit_queue  # type: ignore
+        except Exception:
+            return
+        payload = {
+            "agentId": self._registered_agent_id or self.agent_id,
+            "sessionId": session_id,
+            "eventType": event_type,
+            "sdkVersion": SDK_VERSION,
+            "framework": self.framework,
+            "mode": self._normalize_mode(self.mode),
+        }
+        try:
+            queue = get_audit_queue()
+            queue.enqueue_session_event(payload)
+        except Exception:
+            pass
 
     def register_agent(self, agent_name: str, system_prompt: str,
                         tools: List[Any], policies: Optional[List[PolicyDocument]] = None) -> str:
@@ -353,12 +471,13 @@ class KyraGovernor:
                     k: str(v) for k, v in (t.args_schema.schema().get("properties", {}) or {}).items()
                 } if hasattr(t, "args_schema") and t.args_schema else {},
             }
-            rt = getattr(t, "requested_tier", None)
-            if rt:
-                d["requestedTier"] = rt
+            requested_tier = getattr(t, "requested_tier", None)
+            if requested_tier:
+                d["requestedTier"] = requested_tier
             tool_defs.append(d)
         import hashlib, json
-        source_hash = hashlib.sha256(
+        tool_defs.sort(key=lambda x: x["name"])
+        source_hash = "sha256:" + hashlib.sha256(
             (system_prompt + json.dumps(tool_defs, sort_keys=True)).encode()
         ).hexdigest()
 

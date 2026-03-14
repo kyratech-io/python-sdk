@@ -1,6 +1,6 @@
 from typing import Any
 
-from langchain_kyra.models import ErrGovernanceBlock
+from ..models import ErrGovernanceBlock
 
 
 class KyraToolNode:
@@ -35,7 +35,7 @@ class KyraToolNode:
 
         # If all passed, delegate to original ToolNode
         result = self.tool_node(state)
-        # Hook 4: record each tool result for agentTrace
+        # Hook 4: record each tool result for agentTrace and emit tool-result audit
         try:
             messages = result.get("messages", [])
             for msg in messages:
@@ -49,6 +49,15 @@ class KyraToolNode:
                         success=True,
                         sequence_number=self.governor._tracer.next_sequence(),
                     )
+                    try:
+                        self.governor._emit_tool_result(
+                            tool_name=name,
+                            execution_time_ms=0,
+                            success=True,
+                            error_message=None,
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
         return result

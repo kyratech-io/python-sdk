@@ -24,7 +24,7 @@ def create_governed_agent(
 
     Example:
         from mem0 import MemoryClient
-        from langchain_kyra.compat.mem0 import create_governed_agent
+        from kyra_sdk.compat.mem0 import create_governed_agent
 
         governed_tools, governor = create_governed_agent(
             tools=my_tools,

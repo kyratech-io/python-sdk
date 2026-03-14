@@ -29,12 +29,10 @@ class KyraWrappedTool(BaseTool):
         return getattr(self.wrapped_tool, "args_schema", None)
 
     def _run(self, *args, **kwargs) -> Any:
-        requested_tier = getattr(self.wrapped_tool, "requested_tier", None)
         ok, block_reason = self.governor._evaluate_before_call(
             tool_name=self.wrapped_tool.name,
             tool_description=self.wrapped_tool.description,
             parameters=kwargs,
-            requested_tier=requested_tier,
             framework_override=self.framework_wire,
         )
         if not ok:
@@ -50,6 +48,15 @@ class KyraWrappedTool(BaseTool):
                 success=True,
                 sequence_number=self.governor._tracer.next_sequence(),
             )
+            try:
+                self.governor._emit_tool_result(
+                    tool_name=self.wrapped_tool.name,
+                    execution_time_ms=execution_time_ms,
+                    success=True,
+                    error_message=None,
+                )
+            except Exception:
+                pass
             return result
         except Exception as e:
             execution_time_ms = int((time.perf_counter() - start) * 1000)
@@ -60,15 +67,22 @@ class KyraWrappedTool(BaseTool):
                 success=False,
                 sequence_number=self.governor._tracer.next_sequence(),
             )
+            try:
+                self.governor._emit_tool_result(
+                    tool_name=self.wrapped_tool.name,
+                    execution_time_ms=execution_time_ms,
+                    success=False,
+                    error_message=str(e),
+                )
+            except Exception:
+                pass
             raise
 
     async def _arun(self, *args, **kwargs) -> Any:
-        requested_tier = getattr(self.wrapped_tool, "requested_tier", None)
         ok, block_reason = await self.governor._evaluate_before_call_async(
             tool_name=self.wrapped_tool.name,
             tool_description=self.wrapped_tool.description,
             parameters=kwargs,
-            requested_tier=requested_tier,
             framework_override=self.framework_wire,
         )
         if not ok:

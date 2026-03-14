@@ -11,7 +11,7 @@ class GovernanceContext:
     """
     Immutable record propagated across all agent hops in a trace.
     Set once at session start (from user's message).
-    aggregate_action_count and highest_tier_in_chain may be updated by the governor after each evaluate.
+    aggregate_action_count may be updated by the governor after each evaluate.
     """
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     root_agent_id: str = ""
@@ -20,11 +20,12 @@ class GovernanceContext:
     chain_depth: int = 0
     aggregate_rows_affected: int = 0
     aggregate_action_count: int = 0
-    highest_tier_in_chain: str = ""
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     hops: List[dict] = field(default_factory=list)
     parent_trace_id: Optional[str] = None
     parent_agent_id: Optional[str] = None
+    # Internal-only: last kyraEventId returned from evaluation for this context.
+    last_kyra_event_id: Optional[str] = None
 
     @classmethod
     def from_human_message(cls, message: str, root_agent_id: str = "") -> "GovernanceContext":
@@ -36,7 +37,6 @@ class GovernanceContext:
             original_intent_hash=hashlib.sha256(intent.encode("utf-8")).hexdigest(),
             session_id=str(uuid.uuid4()),
             aggregate_action_count=0,
-            highest_tier_in_chain="",
         )
 
     @classmethod
@@ -49,7 +49,6 @@ class GovernanceContext:
             chain_depth=parent.chain_depth,
             aggregate_rows_affected=parent.aggregate_rows_affected,
             aggregate_action_count=0,
-            highest_tier_in_chain="T0",
             session_id=parent.session_id,
             hops=list(parent.hops),
             parent_trace_id=parent.trace_id,
@@ -75,7 +74,6 @@ class GovernanceContext:
             chain_depth=self.chain_depth,
             aggregate_rows_affected=self.aggregate_rows_affected,
             aggregate_action_count=self.aggregate_action_count,
-            highest_tier_in_chain=self.highest_tier_in_chain,
             session_id=self.session_id,
             parent_trace_id=self.parent_trace_id,
             parent_agent_id=self.parent_agent_id,

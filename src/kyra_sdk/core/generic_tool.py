@@ -28,7 +28,6 @@ class GenericWrappedTool:
             tool_name=self.name,
             tool_description=self.description,
             parameters=kwargs,
-            requested_tier=getattr(self._tool, "requested_tier", None),
             framework_override="GENERIC",
         )
         if not ok:
@@ -50,6 +49,16 @@ class GenericWrappedTool:
                 success=True,
                 sequence_number=self._governor._tracer.next_sequence(),
             )
+            # Emit tool-result audit event if kyraEventId is available.
+            try:
+                self._governor._emit_tool_result(
+                    tool_name=self.name,
+                    execution_time_ms=execution_time_ms,
+                    success=True,
+                    error_message=None,
+                )
+            except Exception:
+                pass
             return result
         except Exception:
             execution_time_ms = int((time.perf_counter() - start) * 1000)
@@ -60,4 +69,13 @@ class GenericWrappedTool:
                 success=False,
                 sequence_number=self._governor._tracer.next_sequence(),
             )
+            try:
+                self._governor._emit_tool_result(
+                    tool_name=self.name,
+                    execution_time_ms=execution_time_ms,
+                    success=False,
+                    error_message="",
+                )
+            except Exception:
+                pass
             raise
